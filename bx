@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+# bx — background execute: run, list, tail, dump, and kill background jobs.
+set -euo pipefail
+
+resolve_path() {
+    local path=$1 dir
+    while [[ -L $path ]]; do
+        dir=$(cd "$(dirname "$path")" && pwd)
+        path=$(readlink "$path")
+        [[ $path != /* ]] && path="$dir/$path"
+    done
+    dir=$(cd "$(dirname "$path")" && pwd)
+    echo "$dir/$(basename "$path")"
+}
+
+BX_REAL="$(resolve_path "${BASH_SOURCE[0]}")"
+BX_HOME="$(dirname "$BX_REAL")"
+BX_STATE="$BX_HOME/state"
+BX_LOGS="$BX_HOME/logs"
+
+# --- helpers -----------------------------------------------------------------
+
+die() { echo "bx: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: bx <command> [options]
+
+Commands:
+  run     Start a command in the background (default if omitted)
+  list    List running jobs (use -a to include completed jobs)
+  tail    Follow logs from a running job
+  dump    Print logs from a completed job
+  kill    Stop a running job
+
+Run options:
+  -n, --notify       Notify when the command finishes
+  -d, --log-dir DIR  Log directory (default: $BX_HOME/logs/<job-id>/)
+  --no-nohup         Do not wrap the command in nohup
+
+  bx run [-n] [-d DIR] [--no-nohup] -- <command> [args...]
+  bx [-n] [-d DIR] [--no-nohup] -- <command> [args...]
+
+List options:
+  -a, --all          Include completed jobs from the last 24 hours
+
+Tail options:
+  -e, --stderr       Follow stderr instead of stdout (default)
+
+Examples:
+  bx run -- python train.py --epochs 10
+  bx -n -- make build
+  bx list
+  bx list -a
+  bx tail abc123
+  bx tail -e abc123
+  bx dump abc123
+  bx kill abc123
+EOF
+}
+
+ensure_dirs() {
+    mkdir -p "$BX_STATE" "$BX_LOGS"
+}
+
+now_epoch() { date +%s; }
+
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+format_duration() {
+    local secs=$1
+    local d h m s
+    d=$((secs / 86400))
+    h=$(((secs % 86400) / 3600))
+    m=$(((secs % 3600) / 60))
+    s=$((secs % 60))
+    local out=""
+    ((d > 0)) && out+="${d}d "
+    ((h > 0)) && out+="${h}h "
+    ((m > 0)) && out+="${m}m "
+    out+="${s}s"
+    echo "${out## }"
+}
+
+human_size() {
+    local bytes=$1
+    if ((bytes < 1024)); then
+        echo "${bytes}B"
+    elif ((bytes < 1048576)); then
+        echo "$((bytes / 1024))K"
+    elif ((bytes < 1073741824)); then
+        echo "$((bytes / 1048576))M"
+    else
+        echo "$((bytes / 1073741824))G"
+    fi
+}
+
+generate_id() {
+    local ts rand
+    ts=$(date +%Y%m%d%H%M%S)
+    rand=$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(2))
+PY
+)
+    echo "${ts}-${rand}"
+}
+
+state_file() { echo "$BX_STATE/$1.json"; }
+
+read_field() {
+    local file=$1 key=$2
+    python3 - "$file" "$key" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+val = data.get(sys.argv[2])
+if val is None:
+    sys.exit(1)
+if isinstance(val, bool):
+    print("true" if val else "false")
+else:
+    print(val)
+PY
+}
+
+write_state() {
+    local id=$1 command=$2 pid=$3 started_at=$4 log_dir=$5 notify=$6
+    python3 - "$id" "$command" "$pid" "$started_at" "$log_dir" "$notify" "$BX_STATE" <<'PY'
+import json, os, sys
+job_id, command, pid, started_at, log_dir, notify, state_dir = sys.argv[1:8]
+path = os.path.join(state_dir, f"{job_id}.json")
+with open(path, "w") as f:
+    json.dump({
+        "id": job_id,
+        "command": command,
+        "pid": int(pid),
+        "started_at": started_at,
+        "ended_at": None,
+        "exit_code": None,
+        "log_dir": log_dir,
+        "notify": notify == "true",
+    }, f, indent=2)
+    f.write("\n")
+PY
+}
+
+mark_exited() {
+    local id=$1 exit_code=$2 ended_at=$3
+    python3 - "$id" "$exit_code" "$ended_at" "$BX_STATE" <<'PY'
+import json, os, sys
+job_id, exit_code, ended_at, state_dir = sys.argv[1:5]
+path = os.path.join(state_dir, f"{job_id}.json")
+with open(path) as f:
+    data = json.load(f)
+data["ended_at"] = ended_at
+data["exit_code"] = int(exit_code)
+data["pid"] = None
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+job_ids() {
+    shopt -s nullglob
+    local f base
+    for f in "$BX_STATE"/*.json; do
+        base=$(basename "$f" .json)
+        echo "$base"
+    done
+}
+
+is_running() {
+    local pid=$1
+    [[ -n "$pid" && "$pid" != "None" && "$pid" != "null" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+job_exit_code() {
+    local log_dir=$1
+    local code_file="$log_dir/exit_code"
+    if [[ -f "$code_file" ]]; then
+        cat "$code_file"
+    else
+        echo 1
+    fi
+}
+
+refresh_job() {
+    local id=$1
+    local file
+    file=$(state_file "$id")
+    [[ -f "$file" ]] || return 1
+
+    local pid ended_at log_dir
+    pid=$(read_field "$file" pid 2>/dev/null || echo "")
+    ended_at=$(python3 - "$file" <<'PY' 2>/dev/null || echo ""
+import json, sys
+with open(sys.argv[1]) as f:
+    v = json.load(f).get("ended_at")
+print("" if v is None else v)
+PY
+)
+
+    if [[ -n "$ended_at" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$pid" && "$pid" != "None" ]] && ! kill -0 "$pid" 2>/dev/null; then
+        log_dir=$(read_field "$file" log_dir)
+        mark_exited "$id" "$(job_exit_code "$log_dir")" "$(now_iso)"
+    fi
+}
+
+reap_all() {
+    local id
+    for id in $(job_ids); do
+        refresh_job "$id" || true
+    done
+}
+
+notify_done() {
+    local id=$1 command=$2 exit_code=$3
+    local title="bx: job $id finished"
+    local body="exit $exit_code — $command"
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"$body\" with title \"$title\"" >/dev/null 2>&1 || true
+    else
+        echo "$title: $body" >&2
+    fi
+}
+
+watch_job() {
+    local id=$1 log_dir=$2
+    local file pid command notify exit_code
+    file=$(state_file "$id")
+
+    pid=$(read_field "$file" pid)
+    command=$(read_field "$file" command)
+    notify=$(read_field "$file" notify)
+
+    (
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+        done
+        exit_code=$(job_exit_code "$log_dir")
+        mark_exited "$id" "$exit_code" "$(now_iso)"
+        if [[ "$notify" == "true" ]]; then
+            notify_done "$id" "$command" "$exit_code"
+        fi
+    ) >/dev/null 2>&1 &
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_run() {
+    local notify=false use_nohup=true log_dir=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--notify) notify=true; shift ;;
+            -d|--log-dir) log_dir=$2; shift 2 ;;
+            --no-nohup) use_nohup=false; shift ;;
+            --) shift; break ;;
+            -*) die "unknown run option: $1" ;;
+            *) break ;;
+        esac
+    done
+
+    [[ $# -gt 0 ]] || die "run requires a command (use -- before flags/args if needed)"
+
+    ensure_dirs
+
+    local id started_at job_log_dir stdout_log stderr_log
+    id=$(generate_id)
+    started_at=$(now_iso)
+
+    if [[ -n "$log_dir" ]]; then
+        job_log_dir="$log_dir"
+    else
+        job_log_dir="$BX_LOGS/$id"
+    fi
+    mkdir -p "$job_log_dir"
+    stdout_log="$job_log_dir/stdout.log"
+    stderr_log="$job_log_dir/stderr.log"
+
+    local cmd_display
+    cmd_display=$(printf '%q ' "$@")
+    cmd_display=${cmd_display% }
+
+    (
+        set +e
+        if $use_nohup; then
+            nohup "$@"
+        else
+            "$@"
+        fi
+        echo $? >"$job_log_dir/exit_code"
+    ) >"$stdout_log" 2>"$stderr_log" &
+    local pid=$!
+
+    write_state "$id" "$cmd_display" "$pid" "$started_at" "$job_log_dir" "$notify"
+    watch_job "$id" "$job_log_dir"
+
+    echo "$id"
+}
+
+cmd_list() {
+    local show_all=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all) show_all=true; shift ;;
+            -*) die "unknown list option: $1" ;;
+            *) die "unexpected argument: $1" ;;
+        esac
+    done
+
+    ensure_dirs
+    reap_all
+
+    local cutoff now id file command started_at ended_at exit_code log_dir pid
+    now=$(now_epoch)
+    cutoff=$((now - 86400))
+
+    local red green reset
+    if [[ -t 1 ]]; then
+        red=$'\033[31m'
+        green=$'\033[32m'
+        reset=$'\033[0m'
+    else
+        red= green= reset=
+    fi
+
+    printf "%-14s %-8s %-22s %-10s %-6s %s\n" "ID" "STATUS" "STARTED" "ELAPSED" "EXIT" "COMMAND"
+    printf "%-14s %-8s %-22s %-10s %-6s %s\n" "----" "------" "-------" "-------" "----" "-------"
+
+    local ids=()
+    while IFS= read -r id; do ids+=("$id"); done < <(job_ids | sort -r)
+
+    for id in "${ids[@]}"; do
+        file=$(state_file "$id")
+        [[ -f "$file" ]] || continue
+
+        command=$(read_field "$file" command)
+        started_at=$(read_field "$file" started_at)
+        log_dir=$(read_field "$file" log_dir)
+
+        local started_epoch ended_epoch elapsed status exit_display
+        started_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" +%s 2>/dev/null || date -u -d "$started_at" +%s)
+
+        ended_at=$(python3 - "$file" <<'PY' 2>/dev/null || echo ""
+import json, sys
+with open(sys.argv[1]) as f:
+    v = json.load(f).get("ended_at")
+print("" if v is None else v)
+PY
+)
+
+        if [[ -n "$ended_at" ]]; then
+            ended_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ended_at" +%s 2>/dev/null || date -u -d "$ended_at" +%s)
+            elapsed=$((ended_epoch - started_epoch))
+            status="done"
+            exit_code=$(read_field "$file" exit_code)
+            if [[ "$exit_code" == "0" ]]; then
+                exit_display="${green}${exit_code}${reset}"
+            else
+                exit_display="${red}${exit_code}${reset}"
+            fi
+            if ((ended_epoch < cutoff)); then
+                continue
+            fi
+            # Skip completed jobs unless --all is specified
+            if ! $show_all; then
+                continue
+            fi
+        else
+            pid=$(read_field "$file" pid)
+            if is_running "$pid"; then
+                elapsed=$((now - started_epoch))
+                status="running"
+                exit_display="-"
+            else
+                refresh_job "$id"
+                ended_at=$(python3 - "$file" <<'PY' 2>/dev/null || echo ""
+import json, sys
+with open(sys.argv[1]) as f:
+    v = json.load(f).get("ended_at")
+print("" if v is None else v)
+PY
+)
+                if [[ -z "$ended_at" ]]; then
+                    continue
+                fi
+                ended_epoch=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$ended_at" +%s 2>/dev/null || date -u -d "$ended_at" +%s)
+                elapsed=$((ended_epoch - started_epoch))
+                status="done"
+                exit_code=$(read_field "$file" exit_code)
+                if [[ "$exit_code" == "0" ]]; then
+                    exit_display="${green}${exit_code}${reset}"
+                else
+                    exit_display="${red}${exit_code}${reset}"
+                fi
+                if ((ended_epoch < cutoff)); then
+                    continue
+                fi
+                # Skip completed jobs unless --all is specified
+                if ! $show_all; then
+                    continue
+                fi
+            fi
+        fi
+
+        local started_short elapsed_fmt stdout_size stderr_size log_info
+        started_short=${started_at/T/ }
+        started_short=${started_short/Z/}
+        elapsed_fmt=$(format_duration "$elapsed")
+
+        stdout_size=0
+        stderr_size=0
+        [[ -f "$log_dir/stdout.log" ]] && stdout_size=$(stat -f%z "$log_dir/stdout.log" 2>/dev/null || stat -c%s "$log_dir/stdout.log")
+        [[ -f "$log_dir/stderr.log" ]] && stderr_size=$(stat -f%z "$log_dir/stderr.log" 2>/dev/null || stat -c%s "$log_dir/stderr.log")
+        log_info="$log_dir (out:$(human_size "$stdout_size") err:$(human_size "$stderr_size"))"
+
+        printf "%-14s %-8s %-22s %-10s %-6b %s\n" \
+            "$id" "$status" "$started_short" "$elapsed_fmt" "$exit_display" "$command"
+        printf "%*s└─ %s\n" 14 "" "$log_info"
+    done
+}
+
+cmd_tail() {
+    local stream=stdout
+    local id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -e|--stderr) stream=stderr; shift ;;
+            -*) die "unknown tail option: $1" ;;
+            *)
+                [[ -z "$id" ]] || die "unexpected argument: $1"
+                id=$1
+                shift
+                ;;
+        esac
+    done
+
+    [[ -n "$id" ]] || die "tail requires a job id"
+
+    local file pid log_dir log_file
+    file=$(state_file "$id")
+    [[ -f "$file" ]] || die "unknown job: $id"
+
+    pid=$(read_field "$file" pid 2>/dev/null || echo "")
+    is_running "$pid" || die "job $id is not running"
+
+    log_dir=$(read_field "$file" log_dir)
+    log_file="$log_dir/${stream}.log"
+    [[ -f "$log_file" ]] || die "log file not found: $log_file"
+
+    tail -f "$log_file"
+}
+
+cmd_dump() {
+    local id=$1
+    [[ -n "$id" ]] || die "dump requires a job id"
+
+    local file pid ended_at log_dir
+    file=$(state_file "$id")
+    [[ -f "$file" ]] || die "unknown job: $id"
+
+    refresh_job "$id"
+    ended_at=$(python3 - "$file" <<'PY' 2>/dev/null || echo ""
+import json, sys
+with open(sys.argv[1]) as f:
+    v = json.load(f).get("ended_at")
+print("" if v is None else v)
+PY
+)
+    [[ -n "$ended_at" ]] || die "job $id is still running"
+
+    log_dir=$(read_field "$file" log_dir)
+
+    echo "=== stdout ($log_dir/stdout.log) ==="
+    if [[ -f "$log_dir/stdout.log" ]]; then
+        cat "$log_dir/stdout.log"
+    fi
+    echo "=== stderr ($log_dir/stderr.log) ==="
+    if [[ -f "$log_dir/stderr.log" ]]; then
+        cat "$log_dir/stderr.log"
+    fi
+}
+
+cmd_kill() {
+    local id=$1
+    [[ -n "$id" ]] || die "kill requires a job id"
+
+    local file pid
+    file=$(state_file "$id")
+    [[ -f "$file" ]] || die "unknown job: $id"
+
+    pid=$(read_field "$file" pid 2>/dev/null || echo "")
+    is_running "$pid" || die "job $id is not running"
+
+    kill "$pid" 2>/dev/null || die "failed to kill pid $pid"
+    echo "sent SIGTERM to job $id (pid $pid)"
+}
+
+# --- main --------------------------------------------------------------------
+
+main() {
+    local cmd=run
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            -h|--help|help) usage; exit 0 ;;
+            run|list|ls|tail|dump|kill) cmd=$1; shift ;;
+        esac
+    fi
+
+    case "$cmd" in
+        run)
+            if [[ $# -gt 0 && "$1" != -* ]]; then
+                cmd_run -- "$@"
+            else
+                cmd_run "$@"
+            fi
+            ;;
+        list|ls) cmd_list "$@" ;;
+        tail)    cmd_tail "$@" ;;
+        dump)    cmd_dump "$@" ;;
+        kill)    cmd_kill "$@" ;;
+        *)       usage; exit 1 ;;
+    esac
+}
+
+main "$@"
